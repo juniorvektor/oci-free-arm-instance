@@ -49,7 +49,7 @@ jobs:
           N=$(oci resource-manager job list --stack-id "$STACK_ID" --all \
             --query "length(data[?operation=='APPLY' && \"lifecycle-state\"=='SUCCEEDED'])" --raw-output)
           if [ "$N" -gt 0 ]; then
-            gh workflow disable oci-retry --repo "$GITHUB_REPOSITORY"
+            gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY"
             exit 0
           fi
 
@@ -59,20 +59,33 @@ jobs:
             --execution-plan-strategy AUTO_APPROVED --query 'data.id' --raw-output)
           oci resource-manager job get --job-id "$JOB" \
             --wait-for-state SUCCEEDED --wait-for-state FAILED --max-wait-seconds 1100 >/dev/null || true
-          STATE=$(oci resource-manager job get --job-id "$JOB" --query 'data."lifecycle-state"' --raw-output)
+          JOB_JSON=$(oci resource-manager job get --job-id "$JOB")
+          STATE=$(jq -r '.data."lifecycle-state"' <<<"$JOB_JSON")
 
           if [ "$STATE" = "SUCCEEDED" ]; then
             notify "✅ **SUCCESS!** Your OCI VPS was created (attempt #${{ github.run_number }}). Retries stopped. $RUN_URL"
-            gh workflow disable oci-retry --repo "$GITHUB_REPOSITORY"
+            gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY"
             exit 0
           fi
 
-          LOG=$(oci resource-manager job get-job-logs-content --job-id "$JOB" --raw-output | tail -n 40)
-          echo "$LOG"
-          if echo "$LOG" | grep -qi "out of host capacity\|out of capacity"; then
+          # Resource Manager's own failure reason (e.g. TERRAFORM_EXECUTION_ERROR + message)
+          FAIL=$(jq -r '.data."failure-details" // {} | [.code, .message] | map(select(. != null and . != "")) | join(": ")' <<<"$JOB_JSON")
+
+          # --query data --raw-output returns the log as plain text instead of a JSON-escaped string
+          LOG=$(oci resource-manager job get-job-logs-content --job-id "$JOB" --query data --raw-output 2>&1 || true)
+          echo "$LOG" | tail -n 80
+
+          if printf '%s\n%s' "$LOG" "$FAIL" | grep -qi "out of host capacity\|out of capacity"; then
             notify "⏳ Attempt #${{ github.run_number }}: out of capacity. Will retry in ~${RETRY_MINUTES} min."
           else
-            ERR=$(echo "$LOG" | grep -i "error" | tail -n 3)
-            notify "❌ Attempt #${{ github.run_number }} failed with a non-capacity error (won't fix itself, check it): \`\`\`${ERR:-unknown}\`\`\` $RUN_URL"
+            # Terraform errors span several lines ("Error: ..." followed by details), so keep some context
+            ERR=$(echo "$LOG" | grep -iA4 "error" | grep -v '^--$' | tail -n 15)
+            [ -z "$ERR" ] && ERR=$(echo "$LOG" | tail -n 10)
+            DETAILS="State: ${STATE:-unknown}"
+            [ -n "$FAIL" ] && DETAILS="$DETAILS"$'\n'"Reason: $FAIL"
+            [ -n "$ERR" ] && DETAILS="$DETAILS"$'\n'"$ERR"
+            # Discord rejects messages over 2000 chars
+            DETAILS=$(printf '%s' "$DETAILS" | tail -c 1500)
+            notify "❌ Attempt #${{ github.run_number }} failed with a non-capacity error (won't fix itself, check it):"$'\n'"\`\`\`"$'\n'"$DETAILS"$'\n'"\`\`\`"$'\n'"$RUN_URL"
           fi
           exit 1
