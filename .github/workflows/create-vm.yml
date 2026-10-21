@@ -1,4 +1,4 @@
-name: oci-retry
+name: create-vm
 on:
   schedule:
     - cron: '*/10 * * * *'
