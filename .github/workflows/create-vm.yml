@@ -1,7 +1,5 @@
 name: create-vm
 on:
-  schedule:
-    - cron: '*/20 * * * *'
   workflow_dispatch:
 concurrency: oci-retry
 permissions:
